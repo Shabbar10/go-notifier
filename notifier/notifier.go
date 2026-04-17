@@ -10,7 +10,7 @@ import (
 
 	"gopkg.in/alecthomas/kingpin.v2"
 
-	pkg "github.com/keybase/go-notifier"
+	pkg "github.com/Shabbar10/go-notifier"
 )
 
 func main() {
