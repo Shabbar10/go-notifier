@@ -1,169 +1,143 @@
-// Copyright 2016 Keybase, Inc. All rights reserved. Use of
-// this source code is governed by the included BSD license.
-
-// Modified from https://github.com/julienXX/terminal-notifier
-// Modified from https://github.com/vjeantet/alerter
-
-#import <Cocoa/Cocoa.h>
+#import <UserNotifications/UserNotifications.h>
 #import <objc/runtime.h>
 
-NSString *_fakeBundleIdentifier = nil;
+// Bundle identifier swizzling for non-bundled apps
+static NSString *_fakeBundleIdentifier = nil;
+
 @implementation NSBundle (FakeBundleIdentifier)
 - (NSString *)__bundleIdentifier {
-  if (self == [NSBundle mainBundle]) {
-    return _fakeBundleIdentifier ? _fakeBundleIdentifier : @"com.apple.Terminal";
-  } else {
+    if (self == [NSBundle mainBundle]) {
+        return _fakeBundleIdentifier ? _fakeBundleIdentifier : @"com.synchronum.notifier";
+    }
     return [self __bundleIdentifier];
-  }
 }
 @end
 
-static BOOL installFakeBundleIdentifierHook() {
-  Class class = objc_getClass("NSBundle");
-  if (class) {
-    method_exchangeImplementations(class_getInstanceMethod(class, @selector(bundleIdentifier)), class_getInstanceMethod(class, @selector(__bundleIdentifier)));
-    return YES;
-  }
-  return NO;
-}
-
-@interface NotificationDelegate : NSObject <NSUserNotificationCenterDelegate>
-@property NSTimeInterval timeout;
-@property (retain) NSString *uuid;
-@end
-
-CFStringRef deliverNotification(CFStringRef titleRef, CFStringRef subtitleRef, CFStringRef messageRef, CFStringRef appIconURLStringRef,
-  CFArrayRef actionsRef, CFStringRef bundleIDRef, CFStringRef groupIDRef, NSTimeInterval timeout, bool debug) {
-
-  if (bundleIDRef) {
-    _fakeBundleIdentifier = (NSString *)bundleIDRef;
-  }
-  installFakeBundleIdentifierHook();
-
-  NSUserNotification *userNotification = [[NSUserNotification alloc] init];
-  userNotification.title = (NSString *)titleRef;
-  userNotification.subtitle = (NSString *)subtitleRef;
-  userNotification.informativeText = (NSString *)messageRef;
-  NSMutableDictionary *options = [NSMutableDictionary dictionary];
-  if (groupIDRef) {
-    options[@"groupID"] = (NSString *)groupIDRef;
-  }
-  NSString *uuid = [[NSUUID UUID] UUIDString];
-  options[@"uuid"] = uuid;
-  userNotification.userInfo = options;
-  if (appIconURLStringRef) {
-    NSURL *appIconURL = [NSURL URLWithString:(NSString *)appIconURLStringRef];
-    NSImage *image = [[NSImage alloc] initWithContentsOfURL:appIconURL];
-    if (image) {
-      [userNotification setValue:image forKey:@"_identityImage"];
-      [userNotification setValue:@(false) forKey:@"_identityImageHasBorder"];
+static void installFakeBundleIdentifierHook() {
+    Class class = objc_getClass("NSBundle");
+    if (class) {
+        method_exchangeImplementations(
+            class_getInstanceMethod(class, @selector(bundleIdentifier)),
+            class_getInstanceMethod(class, @selector(__bundleIdentifier))
+        );
     }
-  }
-  NSArray *actions = (NSArray *)actionsRef;
-  if ([actions count] == 1) {
-    [userNotification setValue:@YES forKey:@"_showsButtons"];
-    userNotification.actionButtonTitle = [actions objectAtIndex:0];
-  } else if ([actions count] == 2) {
-    [userNotification setValue:@YES forKey:@"_showsButtons"];
-    userNotification.otherButtonTitle = [actions objectAtIndex:0];
-    userNotification.actionButtonTitle = [actions objectAtIndex:1];
-  } else if ([actions count] >= 3) {
-    userNotification.otherButtonTitle = [actions objectAtIndex:0];
-    NSArray *alternateActions = [actions subarrayWithRange:NSMakeRange(1, [actions count] - 1)];
-    [userNotification setValue:@YES forKey:@"_showsButtons"];
-    [userNotification setValue:@YES forKey:@"_alwaysShowAlternateActionMenu"];
-    [userNotification setValue:alternateActions forKey:@"_alternateActionButtonTitles"];
-  }
-
-  NSUserNotificationCenter *userNotificationCenter = [NSUserNotificationCenter defaultUserNotificationCenter];
-  if (debug) NSLog(@"Deliver: %@", userNotification);
-  NotificationDelegate *delegate = [[NotificationDelegate alloc] init];
-  delegate.timeout = timeout;
-  delegate.uuid = uuid;
-  userNotificationCenter.delegate = delegate;
-  [userNotificationCenter deliverNotification:userNotification];
-
-  [[NSRunLoop mainRunLoop] run];
-
-  return nil;
 }
 
-@implementation NotificationDelegate
+// Go callback declared in notifier_darwin.go
+extern void onNotificationAction(const char *notifID, const char *actionID);
 
-- (BOOL)userNotificationCenter:(NSUserNotificationCenter *)center shouldPresentNotification:(NSUserNotification *)userNotification {
-  return YES;
+@interface NotifDelegate : NSObject <UNUserNotificationCenterDelegate>
+@end
+
+@implementation NotifDelegate
+
+- (void)userNotificationCenter:(UNUserNotificationCenter *)center
+    didReceiveNotificationResponse:(UNNotificationResponse *)response
+    withCompletionHandler:(void (^)(void))completionHandler {
+
+    const char *notifID = [response.notification.request.identifier UTF8String];
+    const char *actionID = [response.actionIdentifier UTF8String];
+    onNotificationAction(notifID, actionID);
+    completionHandler();
 }
 
-- (void)remove:(NSUserNotification *)userNotification center:(NSUserNotificationCenter *)center fromActivation:(BOOL)fromActivation timedOut:(BOOL)timedOut {
-  dispatch_async(dispatch_get_main_queue(), ^{
-      [center removeDeliveredNotification:userNotification];
-      dispatch_async(dispatch_get_main_queue(), ^{
-        if (!fromActivation && !timedOut) {
-          [self writeResponse:@{@"action": userNotification.otherButtonTitle, @"type": @"action"}];
+- (void)userNotificationCenter:(UNUserNotificationCenter *)center
+    willPresentNotification:(UNNotification *)notification
+    withCompletionHandler:(void (^)(UNNotificationPresentationOptions))completionHandler {
+    completionHandler(UNNotificationPresentationOptionBanner | UNNotificationPresentationOptionSound);
+}
+
+@end
+
+static NotifDelegate *sharedDelegate = nil;
+static NSMutableSet<UNNotificationCategory *> *registeredCategories = nil;
+
+void requestAuthorization(const char *bundleID) {
+    // Only swizzle bundle ID if explicitly provided (for non-bundled apps)
+    if (bundleID && strlen(bundleID) > 0) {
+        _fakeBundleIdentifier = [NSString stringWithUTF8String:bundleID];
+        installFakeBundleIdentifierHook();
+    }
+
+    UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
+
+    if (!sharedDelegate) {
+        sharedDelegate = [[NotifDelegate alloc] init];
+        center.delegate = sharedDelegate;
+    }
+
+    if (!registeredCategories) {
+        registeredCategories = [NSMutableSet set];
+    }
+
+    [center requestAuthorizationWithOptions:(UNAuthorizationOptionAlert | UNAuthorizationOptionSound)
+        completionHandler:^(BOOL granted, NSError *error) {
+            if (error) {
+                NSLog(@"Notification auth error: %@", error);
+            }
+            if (granted) {
+                NSLog(@"Notification permission granted");
+            } else {
+                NSLog(@"Notification permission denied");
+            }
+        }];
+}
+
+void deliverNotification(const char *notifID, const char *title, const char *message, const char *imagePath,
+    const char **actionKeys, const char **actionLabels, int actionCount) {
+
+    UNMutableNotificationContent *content = [[UNMutableNotificationContent alloc] init];
+    content.title = [NSString stringWithUTF8String:title];
+    content.body = [NSString stringWithUTF8String:message];
+    content.sound = [UNNotificationSound defaultSound];
+
+    if (imagePath && strlen(imagePath) > 0) {
+        NSURL *imageURL = [NSURL fileURLWithPath:[NSString stringWithUTF8String:imagePath]];
+        NSError *error = nil;
+        UNNotificationAttachment *attachment = [UNNotificationAttachment
+            attachmentWithIdentifier:@"image"
+            URL:imageURL
+            options:nil
+            error:&error];
+        if (attachment) {
+            content.attachments = @[attachment];
         }
-        fflush(stdout);
-        fflush(stderr);
-        exit(0);
-      });
-    });
-}
+    }
 
-- (void)writeResponse:(NSDictionary *)dict {
-  NSData *data = [NSJSONSerialization dataWithJSONObject:dict options:0 error:nil];
-  if (data) {
-    [[NSFileHandle fileHandleWithStandardOutput] writeData:data];
-    fflush(stdout);
-  }
-}
-
-- (void)userNotificationCenter:(NSUserNotificationCenter *)center didDeliverNotification:(NSUserNotification *)userNotification {
-  dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-    NSDate *start = [NSDate date];
-    BOOL timedOut = YES;
-    while (-[start timeIntervalSinceNow] < self.timeout) {
-      bool found = NO;
-      for (NSUserNotification *deliveredNotification in [[NSUserNotificationCenter defaultUserNotificationCenter] deliveredNotifications]) {
-        if ([deliveredNotification.userInfo[@"uuid"] isEqual:self.uuid]) {
-          [NSThread sleepForTimeInterval:0.5];
-          found = YES;
-          break;
+    if (actionCount > 0) {
+        NSMutableArray<UNNotificationAction *> *actions = [NSMutableArray array];
+        for (int i = 0; i < actionCount; i++) {
+            UNNotificationAction *action = [UNNotificationAction
+                actionWithIdentifier:[NSString stringWithUTF8String:actionKeys[i]]
+                title:[NSString stringWithUTF8String:actionLabels[i]]
+                options:UNNotificationActionOptionNone];
+            [actions addObject:action];
         }
-      }
-      if (!found) {
-        timedOut = NO;
-        break;
-      }
-    }
-    [self remove:userNotification center:center fromActivation:NO timedOut:timedOut];
-  });
-}
 
-- (void)userNotificationCenter:(NSUserNotificationCenter *)center didActivateNotification:(NSUserNotification *)userNotification {
-  // There is no easy way to determine if close button was clicked
-  // https://stackoverflow.com/questions/21110714/mac-os-x-nsusernotificationcenter-notification-get-dismiss-event-callback
-  switch (userNotification.activationType) {
-    case NSUserNotificationActivationTypeAdditionalActionClicked:
-    case NSUserNotificationActivationTypeActionButtonClicked: {
-      NSString *action = nil;
-      if ([[(NSObject*)userNotification valueForKey:@"_alternateActionButtonTitles"] count] > 1) {
-        NSNumber *alternateActionIndex = [(NSObject*)userNotification valueForKey:@"_alternateActionIndex"];
-        int actionIndex = [alternateActionIndex intValue];
-        action = [(NSObject*)userNotification valueForKey:@"_alternateActionButtonTitles"][actionIndex];
-      } else {
-        action = userNotification.actionButtonTitle;
-      }
-      [self writeResponse:@{@"action": action, @"type": @"action"}];
-      break;
-    }
-    case NSUserNotificationActivationTypeContentsClicked:
-      [self writeResponse:@{@"type": @"clicked"}];
-      break;
-    case NSUserNotificationActivationTypeReplied:
-      break;
-    case NSUserNotificationActivationTypeNone:
-      break;
-  }
-  [self remove:userNotification center:center fromActivation:YES timedOut:NO];
-}
+        NSString *categoryID = [NSString stringWithFormat:@"cat_%s", notifID];
+        UNNotificationCategory *category = [UNNotificationCategory
+            categoryWithIdentifier:categoryID
+            actions:actions
+            intentIdentifiers:@[]
+            options:0];
 
-@end
+        [registeredCategories addObject:category];
+
+        UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
+        [center setNotificationCategories:registeredCategories];
+        content.categoryIdentifier = categoryID;
+    }
+
+    NSString *identifier = [NSString stringWithUTF8String:notifID];
+    UNNotificationRequest *request = [UNNotificationRequest
+        requestWithIdentifier:identifier
+        content:content
+        trigger:nil];
+
+    UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
+    [center addNotificationRequest:request withCompletionHandler:^(NSError *error) {
+        if (error) {
+            NSLog(@"Notification delivery error: %@", error);
+        }
+    }];
+}

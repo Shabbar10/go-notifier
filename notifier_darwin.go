@@ -1,61 +1,108 @@
-// Copyright 2016 Keybase, Inc. All rights reserved. Use of
-// this source code is governed by the included BSD license.
-
 package notifier
 
 /*
-#cgo CFLAGS: -x objective-c
-#cgo LDFLAGS: -framework Cocoa
-#import <Cocoa/Cocoa.h>
-extern CFStringRef deliverNotification(CFStringRef title, CFStringRef subtitle, CFStringRef message, CFStringRef appIconURLString, CFArrayRef actions, CFStringRef groupID, CFStringRef bundleID, NSTimeInterval timeout, bool debug);
+#cgo LDFLAGS: -framework Foundation -framework UserNotifications
+#include <stdlib.h>
+
+void requestAuthorization(const char *bundleID);
+void deliverNotification(const char *notifID, const char *title, const char *message, const char *imagePath,
+    const char **actionKeys, const char **actionLabels, int actionCount);
 */
 import "C"
-import "fmt"
+import (
+	"fmt"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"unsafe"
+)
 
-type darwinNotifier struct{}
+var (
+	callbacks    = make(map[string]func(string))
+	callbacksMu sync.Mutex
+	notifCounter atomic.Uint64
+)
 
-// NewNotifier constructs notifier for Windows
+type darwinNotifier struct {
+	authorized bool
+}
+
+// NewNotifier constructs notifier for macOS
 func NewNotifier() (Notifier, error) {
 	return &darwinNotifier{}, nil
 }
 
-// DeliverNotification sends a notification
-func (n darwinNotifier) DeliverNotification(notification Notification) error {
-	titleRef, err := StringToCFString(notification.Title)
-	if err != nil {
-		return err
-	}
-	defer Release(C.CFTypeRef(titleRef))
-	messageRef, err := StringToCFString(notification.Message)
-	if err != nil {
-		return err
-	}
-	defer Release(C.CFTypeRef(messageRef))
+//export onNotificationAction
+func onNotificationAction(cNotifID *C.char, cActionID *C.char) {
+	notifID := C.GoString(cNotifID)
+	actionID := C.GoString(cActionID)
 
-	var bundleIDRef C.CFStringRef
-	if notification.BundleID != "" {
-		bundleIDRef, err = StringToCFString(notification.BundleID)
-		if err != nil {
-			return err
+	// Ignore default tap and dismiss — only fire for custom action buttons
+	if strings.HasPrefix(actionID, "com.apple.") {
+		return
+	}
+
+	callbacksMu.Lock()
+	cb, ok := callbacks[notifID]
+	if ok {
+		delete(callbacks, notifID)
+	}
+	callbacksMu.Unlock()
+
+	if ok && cb != nil {
+		cb(actionID)
+	}
+}
+
+// DeliverNotification sends a notification via UNUserNotificationCenter
+func (n *darwinNotifier) DeliverNotification(notification Notification) error {
+	if !n.authorized {
+		cBundleID := C.CString(notification.BundleID)
+		C.requestAuthorization(cBundleID)
+		C.free(unsafe.Pointer(cBundleID))
+		n.authorized = true
+	}
+
+	id := notifCounter.Add(1)
+	notifID := fmt.Sprintf("notif_%d", id)
+
+	if len(notification.Actions) > 0 && notification.OnAction != nil {
+		callbacksMu.Lock()
+		callbacks[notifID] = notification.OnAction
+		callbacksMu.Unlock()
+	}
+
+	cNotifID := C.CString(notifID)
+	defer C.free(unsafe.Pointer(cNotifID))
+	cTitle := C.CString(notification.Title)
+	defer C.free(unsafe.Pointer(cTitle))
+	cMessage := C.CString(notification.Message)
+	defer C.free(unsafe.Pointer(cMessage))
+	cImagePath := C.CString(notification.ImagePath)
+	defer C.free(unsafe.Pointer(cImagePath))
+
+	actionCount := len(notification.Actions)
+	var cKeys **C.char
+	var cLabels **C.char
+
+	if actionCount > 0 {
+		keys := make([]*C.char, actionCount)
+		labels := make([]*C.char, actionCount)
+		for i, a := range notification.Actions {
+			keys[i] = C.CString(a.Key)
+			labels[i] = C.CString(a.Label)
 		}
-		defer Release(C.CFTypeRef(bundleIDRef))
+		cKeys = &keys[0]
+		cLabels = &labels[0]
+
+		defer func() {
+			for i := 0; i < actionCount; i++ {
+				C.free(unsafe.Pointer(keys[i]))
+				C.free(unsafe.Pointer(labels[i]))
+			}
+		}()
 	}
 
-	var appIconURLStringRef C.CFStringRef
-	if notification.ImagePath != "" {
-		appIconURLString := fmt.Sprintf("file://%s", notification.ImagePath)
-		appIconURLStringRef, err = StringToCFString(appIconURLString)
-		if err != nil {
-			return err
-		}
-		defer Release(C.CFTypeRef(appIconURLStringRef))
-	}
-
-	actionsRef := StringsToCFArray(notification.Actions)
-	defer Release(C.CFTypeRef(actionsRef))
-
-	C.deliverNotification(titleRef, nil, messageRef, appIconURLStringRef, actionsRef,
-		bundleIDRef, nil, C.NSTimeInterval(notification.Timeout), false)
-
+	C.deliverNotification(cNotifID, cTitle, cMessage, cImagePath, cKeys, cLabels, C.int(actionCount))
 	return nil
 }
