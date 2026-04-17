@@ -3,14 +3,21 @@
 
 package notifier
 
+// Action defines a notification button
+type Action struct {
+	Key   string // Identifier returned in the callback
+	Label string // Text displayed on the button
+}
+
 // Notification defines a notification
 type Notification struct {
 	Title     string
 	Message   string
 	ImagePath string
+	Actions   []Action
+	OnAction  func(actionKey string) // Called when the user clicks an action button
 
 	// For darwin
-	Actions  []string
 	Timeout  float64
 	BundleID string
 
