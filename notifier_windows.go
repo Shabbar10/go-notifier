@@ -1,6 +1,7 @@
 package notifier
 
 import (
+	"fmt"
 	"os/exec"
 	"strings"
 )
@@ -35,7 +36,11 @@ func (n *windowsNotifier) DeliverNotification(notification Notification) error {
 
 	toasterPath := notification.ToastPath
 	if toasterPath == "" {
-		toasterPath = "toaster.exe"
+		var err error
+		toasterPath, err = getToasterPath()
+		if err != nil {
+			return fmt.Errorf("could not extract toaster.exe: %w", err)
+		}
 	}
 
 	cmd := exec.Command(toasterPath, args...)
