@@ -1,7 +1,6 @@
 package notifier
 
 import (
-	"fmt"
 	"os/exec"
 	"strings"
 )
@@ -13,70 +12,33 @@ func NewNotifier() (Notifier, error) {
 	return &windowsNotifier{}, nil
 }
 
-// DeliverNotification sends a toast notification via PowerShell
+// DeliverNotification sends a toast notification via the toaster helper
 func (n *windowsNotifier) DeliverNotification(notification Notification) error {
-	// Build the toast XML
-	var actionsXML string
+	args := []string{
+		"--title", notification.Title,
+		"--message", notification.Message,
+	}
+
 	if len(notification.Actions) > 0 {
-		var buttons []string
+		var keys, labels []string
 		for _, a := range notification.Actions {
-			buttons = append(buttons, fmt.Sprintf(
-				`<action content="%s" arguments="%s" activationType="foreground"/>`,
-				escapeXML(a.Label), escapeXML(a.Key),
-			))
+			keys = append(keys, a.Key)
+			labels = append(labels, a.Label)
 		}
-		actionsXML = "<actions>" + strings.Join(buttons, "") + "</actions>"
+		args = append(args, "--action-keys", strings.Join(keys, ","))
+		args = append(args, "--action-labels", strings.Join(labels, ","))
 	}
 
-	var imageXML string
 	if notification.ImagePath != "" {
-		imageXML = fmt.Sprintf(` <image placement="appLogoOverride" src="%s"/>`, escapeXML(notification.ImagePath))
+		args = append(args, "--image", notification.ImagePath)
 	}
 
-	toastXML := fmt.Sprintf(`<toast>
-  <visual>
-    <binding template="ToastGeneric">
-      <text>%s</text>
-      <text>%s</text>%s
-    </binding>
-  </visual>
-  %s
-</toast>`, escapeXML(notification.Title), escapeXML(notification.Message), imageXML, actionsXML)
-
-	// PowerShell script to show the toast and optionally capture the action
-	var ps string
-	if len(notification.Actions) > 0 && notification.OnAction != nil {
-		// With actions: register for activation and wait
-		ps = fmt.Sprintf(`
-[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
-[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom, ContentType = WindowsRuntime] | Out-Null
-$xml = New-Object Windows.Data.Xml.Dom.XmlDocument
-$xml.LoadXml('%s')
-$toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
-Register-ObjectEvent -InputObject $toast -EventName Activated -SourceIdentifier ToastActivated
-$notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe")
-$notifier.Show($toast)
-$evt = Wait-Event -SourceIdentifier ToastActivated -Timeout 30
-if ($evt) {
-    Write-Host $evt.SourceEventArgs.Arguments
-    Remove-Event -SourceIdentifier ToastActivated
-}
-Unregister-Event -SourceIdentifier ToastActivated -ErrorAction SilentlyContinue
-`, strings.ReplaceAll(toastXML, "'", "''"))
-	} else {
-		// Simple notification without waiting
-		ps = fmt.Sprintf(`
-[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
-[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom, ContentType = WindowsRuntime] | Out-Null
-$xml = New-Object Windows.Data.Xml.Dom.XmlDocument
-$xml.LoadXml('%s')
-$toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
-$notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe")
-$notifier.Show($toast)
-`, strings.ReplaceAll(toastXML, "'", "''"))
+	toasterPath := notification.ToastPath
+	if toasterPath == "" {
+		toasterPath = "toaster.exe"
 	}
 
-	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", ps)
+	cmd := exec.Command(toasterPath, args...)
 
 	if len(notification.Actions) > 0 && notification.OnAction != nil {
 		go func() {
@@ -85,7 +47,7 @@ $notifier.Show($toast)
 				return
 			}
 			actionKey := strings.TrimSpace(string(out))
-			if actionKey != "" {
+			if actionKey != "" && !strings.HasPrefix(actionKey, "__") {
 				notification.OnAction(actionKey)
 			}
 		}()
@@ -93,13 +55,4 @@ $notifier.Show($toast)
 	}
 
 	return cmd.Run()
-}
-
-func escapeXML(s string) string {
-	s = strings.ReplaceAll(s, "&", "&amp;")
-	s = strings.ReplaceAll(s, "<", "&lt;")
-	s = strings.ReplaceAll(s, ">", "&gt;")
-	s = strings.ReplaceAll(s, "\"", "&quot;")
-	s = strings.ReplaceAll(s, "'", "&apos;")
-	return s
 }
