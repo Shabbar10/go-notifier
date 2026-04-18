@@ -53,13 +53,15 @@ func (n *windowsNotifier) DeliverNotification(notification Notification) error {
 $xml = New-Object Windows.Data.Xml.Dom.XmlDocument
 $xml.LoadXml('%s')
 $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
-$event = Register-ObjectEvent -InputObject $toast -EventName Activated -Action {
-    $args = $Event.SourceEventArgs
-    Write-Host $args.Arguments
-}
+Register-ObjectEvent -InputObject $toast -EventName Activated -SourceIdentifier ToastActivated
 $notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe")
 $notifier.Show($toast)
-Wait-Event -Timeout 30 | Out-Null
+$evt = Wait-Event -SourceIdentifier ToastActivated -Timeout 30
+if ($evt) {
+    Write-Host $evt.SourceEventArgs.Arguments
+    Remove-Event -SourceIdentifier ToastActivated
+}
+Unregister-Event -SourceIdentifier ToastActivated -ErrorAction SilentlyContinue
 `, strings.ReplaceAll(toastXML, "'", "''"))
 	} else {
 		// Simple notification without waiting
